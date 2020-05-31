@@ -14,7 +14,7 @@ from openvino.inference_engine import IENetwork
 from utils.ie_module import InferenceContext
 from core.face_detector import FaceDetector
 from core.headPos_Estimator import HeadPosEstimator
-
+from core.landmarks_detector import LandmarksDetector
 DEVICE_KINDS = ['CPU', 'GPU', 'FPGA', 'MYRIAD', 'HETERO', 'HDDL']
 
 def build_argparser():
@@ -27,17 +27,25 @@ def build_argparser():
                         help="Path to image or video file")
     parser.add_argument("-m_fd", "--mode_face_detection", required=True, type=str,
                         help="Path to an .xml file with a trained Face Detection model")               
+    
     parser.add_argument('-d_fd', default='CPU', choices=DEVICE_KINDS,
                        help="(optional) Target device for the " \
                        "Face Detection model (default: %(default)s)")
     parser.add_argument('-t_fd', metavar='[0..1]', type=float, default=0.6,
                        help="(optional) Probability threshold for face detections" \
                        "(default: %(default)s)")
+
     parser.add_argument("-m_hp", "--model_head_position", required=True, type=str,
                         help="Path to an .xml file with a trained Head Pose Estimation model") 
     parser.add_argument('-d_hp', default='CPU', choices=DEVICE_KINDS,
                        help="(optional) Target device for the " \
                        "Head Position model (default: %(default)s)")
+    parser.add_argument("-m_lm", "--model_landmark_regressor", required=True, type=str,
+                        help="Path to an .xml file with a trained Head Pose Estimation model") 
+    parser.add_argument('-d_lm', default='CPU', choices=DEVICE_KINDS,
+                       help="(optional) Target device for the " \
+                       "Facial Landmarks Regression model (default: %(default)s)")
+    
     parser.add_argument('-pc', '--perf_stats', action='store_true',
                        help="(optional) Output detailed per-layer performance stats")
     parser.add_argument('-exp_r_fd', metavar='NUMBER', type=float, default=1.15,
@@ -70,7 +78,7 @@ class ProcessOnFrame:
     
 
     def __init__(self, args):
-        used_devices = set([args.d_fd, args.d_hp])
+        used_devices = set([args.d_fd, args.d_hp, args.d_lm])
         
         # Create a Inference Engine Context
         self.context = InferenceContext()
@@ -89,6 +97,9 @@ class ProcessOnFrame:
         # Load Headposition model on Inference Engine
         head_position_net = self.load_model(args.model_head_position)
 
+        # Load Landmark regressor model on Inference Engine
+        landmarks_net = self.load_model(args.model_landmark_regressor)
+
         # Configure Face detector [detection threshold, ROI Scale]
         self.face_detector = FaceDetector(face_detector_net,
                                     confidence_threshold=args.t_fd,
@@ -97,11 +108,17 @@ class ProcessOnFrame:
         # Configure Head Pose Estimation
         self.head_estimator = HeadPosEstimator(head_position_net)
 
+        # Configure Landmark regressor
+        self.landmarks_detector = LandmarksDetector(landmarks_net)
+
         # Face detector 
         self.face_detector.deploy(args.d_fd, context)
         
         # Head Position Detector
         self.head_estimator.deploy(args.d_hp, context)
+
+        # Landmark detector
+        self.landmarks_detector.deploy(args.d_lm, context)
         
         log.info("Models are loaded")
     
@@ -190,6 +207,20 @@ class ProcessOnFrame:
 
         return headPoseAngles
 
+    def face_landmark_detector_process(self, frame):
+        frame = self.frame_pre_process(frame)
+
+        # Clean Landmark detection from previous frame
+        self.landmarks_detector.clear()
+
+        # Predict and return landmark detection[left_eye, right_eye, nose_tip, 
+        # left_lip_corner, right_lip_corner]
+        self.landmarks_detector.start_async(frame, self.rois)
+        landmarks = self.landmarks_detector.get_landmarks()
+
+        return landmarks
+
+    
 class DriverMointoring:
     BREAK_KEY_LABELS = "q(Q) or Escape"
     BREAK_KEYS = {ord('q'), ord('Q'), 27}
@@ -271,6 +302,27 @@ class DriverMointoring:
         
         cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
 
+    def createEyeBoundingBox(self, point_x, point_y, scale=1.8):
+        size  = cv2.norm(np.float32(point_x) - point_y)
+        width = scale * size
+        height = width
+        midpoint_x = (point_x[0] + point_y[0]) / 2
+        midpoint_y = (point_x[1] + point_y[1]) / 2
+        result_x  = midpoint_x - (width / 2)
+        result_y  = midpoint_y - (height / 2)
+        return [int(result_x), int(result_y), int(height), int(width)]
+
+    def draw_detection_keypoints(self, frame, landmarks, roi):
+        keypoints = [landmarks.left_eye,
+                     landmarks.right_eye,
+                     landmarks.nose_tip,
+                     landmarks.left_lip_corner,
+                     landmarks.right_lip_corner]
+
+        for point in keypoints:
+            center = roi[0].position + roi[0].size * point
+            cv2.circle(frame, tuple(center.astype(int)), 2, (0, 255, 255), 2)
+        
     def display_interactive_window(self, frame):
         """
         Display using CV Window
@@ -326,10 +378,17 @@ class DriverMointoring:
             # Get head Position
             headPosition = self.frame_processor.head_position_estimator_process(frame)
 
+            # Get face landmarks 
+            landmarks = self.frame_processor.face_landmark_detector_process(frame)
+
             # Draw Face ROI detection
             self.draw_detection_roi(frame, detections)
 
+            # Draw head position
             self.draw_head_poistion_points(frame, headPosition, detections)
+
+            # Draw detection keypoints
+            self.draw_detection_keypoints(frame, landmarks[0], detections)
 
             # Write on disk 
             if output_stream:
