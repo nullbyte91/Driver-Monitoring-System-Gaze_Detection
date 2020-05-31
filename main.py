@@ -1,16 +1,19 @@
 import logging as log
 import sys
-import numpy as np
+import numpy as np 
+
 import os.path as osp
 import cv2
 import time
 
 from argparse import ArgumentParser
+from math import cos, sin, pi
 
 from openvino.inference_engine import IENetwork
 
 from utils.ie_module import InferenceContext
 from core.face_detector import FaceDetector
+from core.headPos_Estimator import HeadPosEstimator
 
 DEVICE_KINDS = ['CPU', 'GPU', 'FPGA', 'MYRIAD', 'HETERO', 'HDDL']
 
@@ -30,6 +33,11 @@ def build_argparser():
     parser.add_argument('-t_fd', metavar='[0..1]', type=float, default=0.6,
                        help="(optional) Probability threshold for face detections" \
                        "(default: %(default)s)")
+    parser.add_argument("-m_hp", "--model_head_position", required=True, type=str,
+                        help="Path to an .xml file with a trained Head Pose Estimation model") 
+    parser.add_argument('-d_hp', default='CPU', choices=DEVICE_KINDS,
+                       help="(optional) Target device for the " \
+                       "Head Position model (default: %(default)s)")
     parser.add_argument('-pc', '--perf_stats', action='store_true',
                        help="(optional) Output detailed per-layer performance stats")
     parser.add_argument('-exp_r_fd', metavar='NUMBER', type=float, default=1.15,
@@ -62,7 +70,7 @@ class ProcessOnFrame:
     
 
     def __init__(self, args):
-        used_devices = set([args.d_fd])
+        used_devices = set([args.d_fd, args.d_hp])
         
         # Create a Inference Engine Context
         self.context = InferenceContext()
@@ -77,14 +85,24 @@ class ProcessOnFrame:
         log.info("Loading models")
         # Load face detection model on Inference Engine
         face_detector_net = self.load_model(args.mode_face_detection)
+        
+        # Load Headposition model on Inference Engine
+        head_position_net = self.load_model(args.model_head_position)
 
         # Configure Face detector [detection threshold, ROI Scale]
         self.face_detector = FaceDetector(face_detector_net,
                                     confidence_threshold=args.t_fd,
                                     roi_scale_factor=args.exp_r_fd)
         
-        # Face detector inference
+        # Configure Head Pose Estimation
+        self.head_estimator = HeadPosEstimator(head_position_net)
+
+        # Face detector 
         self.face_detector.deploy(args.d_fd, context)
+        
+        # Head Position Detector
+        self.head_estimator.deploy(args.d_hp, context)
+        
         log.info("Models are loaded")
     
     def load_model(self, model_path):
@@ -111,7 +129,19 @@ class ProcessOnFrame:
         log.info("Model is loaded")
         
         return model
-    
+
+
+    def frame_pre_process(self, frame):
+        assert len(frame.shape) == 3, \
+            "Expected input frame in (H, W, C) format"
+        assert frame.shape[2] in [3, 4], \
+            "Expected BGR or BGRA input"
+
+        orig_image = frame.copy()
+        frame = frame.transpose((2, 0, 1)) # HWC to CHW
+        frame = np.expand_dims(frame, axis=0)
+        return frame
+
     def face_detector_process(self, frame):
         """
         Predict Face detection
@@ -121,14 +151,7 @@ class ProcessOnFrame:
 
         :return roi [xmin, xmax, ymin, ymax]
         """
-        assert len(frame.shape) == 3, \
-            "Expected input frame in (H, W, C) format"
-        assert frame.shape[2] in [3, 4], \
-            "Expected BGR or BGRA input"
-
-        orig_image = frame.copy()
-        frame = frame.transpose((2, 0, 1)) # HWC to CHW
-        frame = np.expand_dims(frame, axis=0)
+        frame = self.frame_pre_process(frame)
 
         # Clear Face detector from previous frame
         self.face_detector.clear()
@@ -143,7 +166,29 @@ class ProcessOnFrame:
                     " Will be processed only %s of %s." % \
                     (self.QUEUE_SIZE, len(rois)))
             rois = rois[:self.QUEUE_SIZE]
+        
+        self.rois = rois
         return rois
+
+    def head_position_estimator_process(self, frame):
+        """
+        Predict head_position
+
+        Args:
+        The Input Frame
+
+        :return headPoseAngles[angle_y_fc, angle_p_fc, angle_2=r_fc]
+        """
+        frame = self.frame_pre_process(frame)
+
+        # Clean Head Position detection from previous frame
+        self.head_estimator.clear()
+
+        # Predict and return head position[Yaw, Pitch, Roll]
+        self.head_estimator.start_async(frame, self.rois)
+        headPoseAngles = self.head_estimator.get_headposition()
+
+        return headPoseAngles
 
 class DriverMointoring:
     BREAK_KEY_LABELS = "q(Q) or Escape"
@@ -188,6 +233,43 @@ class DriverMointoring:
             cv2.rectangle(frame,
                         tuple(roi[i].position), tuple(roi[i].position + roi[i].size),
                         (0, 220, 0), 2)
+
+    def draw_head_poistion_points(self, frame, points, rois):
+        """
+        Draw Head Position on frame
+        Args:
+        frame: The Input Frame
+        points: [angle_y_fc, angle_p_fc, angle_2=r_fc]
+        roi: [xmin, xmax, ymin, ymax]
+        """
+        # Here head_position_x --> angle_y_fc  # Yaw
+        #      head_position_y --> angle_p_fc  # Pitch
+        #      head_position_z --> angle_r_fc  # Roll
+        cos_r = cos(points.head_position_z * pi / 180)
+        sin_r = sin(points.head_position_z * pi / 180)
+        sin_y = sin(points.head_position_x * pi / 180)
+        cos_y = cos(points.head_position_x * pi / 180)
+        sin_p = sin(points.head_position_y * pi / 180)
+        cos_p = cos(points.head_position_y * pi / 180)
+        
+        xmin = rois[0].position[0]
+        ymin = rois[0].position[1]
+        xmax = rois[0].position[0] + rois[0].size[0]
+        ymax = rois[0].position[1] + rois[0].size[1]
+        x = int(( xmin+ xmax) / 2)
+        y = int((ymin + ymax) / 2)
+
+        angle_len = 80
+        # center to right
+        cv2.line(frame, (x,y), (x+int(angle_len*(cos_r*cos_y+sin_y*sin_p*sin_r)), y+int(angle_len*cos_p*sin_r)), (0, 0, 255), thickness=3)
+        
+        # center to top
+        cv2.line(frame, (x, y), (x+int(angle_len*(cos_r*sin_y*sin_p+cos_y*sin_r)), y-int(angle_len*cos_p*cos_r)), (0, 255, 0), thickness=3)
+        
+        # center to forward
+        cv2.line(frame, (x, y), (x + int(angle_len*sin_y*cos_p), y + int(angle_len*sin_p)), (255, 0, 0), thickness=3)
+        
+        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
 
     def display_interactive_window(self, frame):
         """
@@ -241,9 +323,14 @@ class DriverMointoring:
             # Get Face detection
             detections = self.frame_processor.face_detector_process(frame)
 
+            # Get head Position
+            headPosition = self.frame_processor.head_position_estimator_process(frame)
+
             # Draw Face ROI detection
             self.draw_detection_roi(frame, detections)
-            
+
+            self.draw_head_poistion_points(frame, headPosition, detections)
+
             # Write on disk 
             if output_stream:
                 output_stream.write(frame)
