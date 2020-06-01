@@ -12,6 +12,7 @@ from math import cos, sin, pi
 from openvino.inference_engine import IENetwork
 
 from utils.ie_module import InferenceContext
+from utils.helper import cut_rois, resize_input
 from core.face_detector import FaceDetector
 from core.headPos_Estimator import HeadPosEstimator
 from core.landmarks_detector import LandmarksDetector
@@ -302,17 +303,32 @@ class DriverMointoring:
         
         cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
 
-    def createEyeBoundingBox(self, point_x, point_y, scale=1.8):
-        size  = cv2.norm(np.float32(point_x) - point_y)
-        width = scale * size
-        height = width
-        midpoint_x = (point_x[0] + point_y[0]) / 2
-        midpoint_y = (point_x[1] + point_y[1]) / 2
-        result_x  = midpoint_x - (width / 2)
-        result_y  = midpoint_y - (height / 2)
-        return [int(result_x), int(result_y), int(height), int(width)]
+    def createEyeBoundingBox(self, org_frame, landmarks, roi):
+        w = int(roi[0].size[0])
+        h = int(roi[0].size[1])
+        x = int(roi[0].position[0])
+        y = int(roi[0].position[1])
+        cropped = org_frame[y:y+h, x:x+w]        
+        lef_eye_x = landmarks.left_eye[0] * w
+        lef_eye_y = landmarks.left_eye[1] * h
+        rig_eye_x = landmarks.right_eye[0] * w
+        rig_eye_y = landmarks.right_eye[1] * h
+        out = np.asarray([lef_eye_x,lef_eye_y,rig_eye_x,rig_eye_y])
+        coords = out.astype(np.int32)
+        left_eye_xmin = (coords[0]-15)
+        left_eye_ymin = (coords[1]-15)
+        left_eye_xmax = (coords[0]+15)
+        left_eye_ymax = (coords[1]+15)
+        right_eye_xmin = coords[2]-15  
+        right_eye_ymin = coords[3]-15
+        right_eye_xmax = coords[2]+15
+        right_eye_ymax = coords[3]+15
+        self.left_eye_coords=cropped[left_eye_ymin:left_eye_ymax,left_eye_xmin:left_eye_xmax]
+        self.right_eye_coords=cropped[right_eye_ymin:right_eye_ymax,right_eye_xmin:right_eye_xmax]
+        self.eye=[[left_eye_xmin,left_eye_ymin,left_eye_xmax,left_eye_ymax],
+                 [right_eye_xmin,right_eye_ymin,right_eye_xmax,right_eye_ymax]]
 
-    def draw_detection_keypoints(self, frame, landmarks, roi):
+    def draw_detection_keypoints(self, frame, landmarks, roi, org_frame):
         keypoints = [landmarks.left_eye,
                      landmarks.right_eye,
                      landmarks.nose_tip,
@@ -322,7 +338,8 @@ class DriverMointoring:
         for point in keypoints:
             center = roi[0].position + roi[0].size * point
             cv2.circle(frame, tuple(center.astype(int)), 2, (0, 255, 255), 2)
-        
+        self.createEyeBoundingBox(org_frame, landmarks, roi)
+
     def display_interactive_window(self, frame):
         """
         Display using CV Window
@@ -368,10 +385,11 @@ class DriverMointoring:
             has_frame, frame = input_stream.read()
             if not has_frame:
                 break
-
+            
             if self.input_crop is not None:
                 frame = DriverMointoring.center_crop(frame, self.input_crop)
             
+            self.org_frame = frame.copy()
             # Get Face detection
             detections = self.frame_processor.face_detector_process(frame)
 
@@ -388,7 +406,7 @@ class DriverMointoring:
             self.draw_head_poistion_points(frame, headPosition, detections)
 
             # Draw detection keypoints
-            self.draw_detection_keypoints(frame, landmarks[0], detections)
+            self.draw_detection_keypoints(frame, landmarks[0], detections, self.org_frame)
 
             # Write on disk 
             if output_stream:
