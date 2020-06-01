@@ -31,7 +31,6 @@ class GazeEestimator(Module):
         self.output_blob = next(iter(model.outputs))
     
     def enqueue(self, head_pose, right_eye, left_eye):
-        print(self.input_blob)
         return super(GazeEestimator, self).enqueue({'left_eye_image': left_eye,
                                                     'right_eye_image': right_eye,
                                                     'head_pose_angles': head_pose})
