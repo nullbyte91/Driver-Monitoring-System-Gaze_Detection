@@ -16,6 +16,8 @@ from utils.helper import cut_rois, resize_input
 from core.face_detector import FaceDetector
 from core.headPos_Estimator import HeadPosEstimator
 from core.landmarks_detector import LandmarksDetector
+from core.gaze_Estimator import GazeEestimator
+
 DEVICE_KINDS = ['CPU', 'GPU', 'FPGA', 'MYRIAD', 'HETERO', 'HDDL']
 
 def build_argparser():
@@ -41,11 +43,18 @@ def build_argparser():
     parser.add_argument('-d_hp', default='CPU', choices=DEVICE_KINDS,
                        help="(optional) Target device for the " \
                        "Head Position model (default: %(default)s)")
+
     parser.add_argument("-m_lm", "--model_landmark_regressor", required=True, type=str,
                         help="Path to an .xml file with a trained Head Pose Estimation model") 
     parser.add_argument('-d_lm', default='CPU', choices=DEVICE_KINDS,
                        help="(optional) Target device for the " \
                        "Facial Landmarks Regression model (default: %(default)s)")
+    
+    parser.add_argument("-m_gm", "--model_gaze", required=True, type=str,
+                        help="Path to an .xml file with a trained Gaze Estimation model") 
+    parser.add_argument('-d_gm', default='CPU', choices=DEVICE_KINDS,
+                       help="(optional) Target device for the " \
+                       "Gaze estimation model (default: %(default)s)")
     
     parser.add_argument('-pc', '--perf_stats', action='store_true',
                        help="(optional) Output detailed per-layer performance stats")
@@ -56,6 +65,7 @@ def build_argparser():
                         help="(optional) Crop the input stream to this width " \
                         "(default: no crop). Both -cw and -ch parameters " \
                         "should be specified to use crop.")
+                        
     parser.add_argument('-v', '--verbose', action='store_true',
                        help="(optional) Be more verbose")
     parser.add_argument('-l', '--cpu_lib', metavar="PATH", default="",
@@ -77,9 +87,8 @@ class ProcessOnFrame:
     # Inference Engine
     QUEUE_SIZE = 1
     
-
     def __init__(self, args):
-        used_devices = set([args.d_fd, args.d_hp, args.d_lm])
+        used_devices = set([args.d_fd, args.d_hp, args.d_lm, args.d_gm])
         
         # Create a Inference Engine Context
         self.context = InferenceContext()
@@ -101,6 +110,9 @@ class ProcessOnFrame:
         # Load Landmark regressor model on Inference Engine
         landmarks_net = self.load_model(args.model_landmark_regressor)
 
+        # Load gaze estimation model on IE
+        gaze_net = self.load_model(args.model_gaze)
+
         # Configure Face detector [detection threshold, ROI Scale]
         self.face_detector = FaceDetector(face_detector_net,
                                     confidence_threshold=args.t_fd,
@@ -111,6 +123,9 @@ class ProcessOnFrame:
 
         # Configure Landmark regressor
         self.landmarks_detector = LandmarksDetector(landmarks_net)
+        
+        # Configure Gaze Estimation
+        self.gaze_estimator = GazeEestimator(gaze_net)
 
         # Face detector 
         self.face_detector.deploy(args.d_fd, context)
@@ -121,6 +136,9 @@ class ProcessOnFrame:
         # Landmark detector
         self.landmarks_detector.deploy(args.d_lm, context)
         
+        # Gaze Estimation
+        self.gaze_estimator.deploy(args.d_gm, context)
+
         log.info("Models are loaded")
     
     def load_model(self, model_path):
@@ -142,6 +160,7 @@ class ProcessOnFrame:
             "Model description is not found at '%s'" % (model_description_path)
         assert osp.isfile(model_weights_path), \
             "Model weights are not found at '%s'" % (model_weights_path)
+           
         # Load model on IE
         model = IENetwork(model_description_path, model_weights_path)
         log.info("Model is loaded")
@@ -150,6 +169,15 @@ class ProcessOnFrame:
 
 
     def frame_pre_process(self, frame):
+        """
+        Pre-Process the input frame given to model
+
+        Args:
+        frame: Input frame from video stream
+
+        Return:
+        frame: Pre-Processed frame
+        """
         assert len(frame.shape) == 3, \
             "Expected input frame in (H, W, C) format"
         assert frame.shape[2] in [3, 4], \
@@ -209,6 +237,14 @@ class ProcessOnFrame:
         return headPoseAngles
 
     def face_landmark_detector_process(self, frame):
+        """
+        Predict Face Landmark
+        
+        Args:
+        The Input Frame
+
+        :return landmarks[left_eye, right_eye, nose_tip, left_lip_corner, right_lip_corner]
+        """
         frame = self.frame_pre_process(frame)
 
         # Clean Landmark detection from previous frame
@@ -221,7 +257,24 @@ class ProcessOnFrame:
 
         return landmarks
 
-    
+    def gaze_estimation_process(self, headPositon, right_eye, left_eye):
+        """
+        Predict Gaze estimation
+        
+        Args:
+        The Input Frame
+
+        :return gaze_vector
+        """
+
+        # Clear gaze vector from the previous frame
+        self.landmarks_detector.clear()
+        
+        # Get the gaze vector
+        self.gaze_estimator.start_async(headPositon, right_eye, left_eye)
+        gaze_vector = self.gaze_estimator.get_gazevector()
+        return gaze_vector
+
 class DriverMointoring:
     BREAK_KEY_LABELS = "q(Q) or Escape"
     BREAK_KEYS = {ord('q'), ord('Q'), 27}
@@ -236,6 +289,8 @@ class DriverMointoring:
         self.fps = 0
         self.frame_num = 0
         self.frame_count = -1
+        self.right_eye_coords = None
+        self.left_eye_coords = None 
 
         self.input_crop = None
         if args.crop_width and args.crop_height:
@@ -266,79 +321,185 @@ class DriverMointoring:
                         tuple(roi[i].position), tuple(roi[i].position + roi[i].size),
                         (0, 220, 0), 2)
 
-    def draw_head_poistion_points(self, frame, points, rois):
+    def createEyeBoundingBox(self, point1, point2, scale=1.8):
         """
-        Draw Head Position on frame
+        Create a Eye bounding box using Two points that we got from headposition model
+
         Args:
-        frame: The Input Frame
-        points: [angle_y_fc, angle_p_fc, angle_2=r_fc]
-        roi: [xmin, xmax, ymin, ymax]
+        point1: First Point coordinate
+        point2: Second Point coordinate
         """
-        # Here head_position_x --> angle_y_fc  # Yaw
-        #      head_position_y --> angle_p_fc  # Pitch
-        #      head_position_z --> angle_r_fc  # Roll
-        cos_r = cos(points.head_position_z * pi / 180)
-        sin_r = sin(points.head_position_z * pi / 180)
-        sin_y = sin(points.head_position_x * pi / 180)
-        cos_y = cos(points.head_position_x * pi / 180)
-        sin_p = sin(points.head_position_y * pi / 180)
-        cos_p = cos(points.head_position_y * pi / 180)
-        
-        xmin = rois[0].position[0]
-        ymin = rois[0].position[1]
-        xmax = rois[0].position[0] + rois[0].size[0]
-        ymax = rois[0].position[1] + rois[0].size[1]
-        x = int(( xmin+ xmax) / 2)
-        y = int((ymin + ymax) / 2)
 
-        angle_len = 80
-        # center to right
-        cv2.line(frame, (x,y), (x+int(angle_len*(cos_r*cos_y+sin_y*sin_p*sin_r)), y+int(angle_len*cos_p*sin_r)), (0, 0, 255), thickness=3)
+        # Normalize the two points
+        size  = cv2.norm(np.float32(point1) - point2)
+        width = int(scale * size)
+        height = width
         
-        # center to top
-        cv2.line(frame, (x, y), (x+int(angle_len*(cos_r*sin_y*sin_p+cos_y*sin_r)), y-int(angle_len*cos_p*cos_r)), (0, 255, 0), thickness=3)
-        
-        # center to forward
-        cv2.line(frame, (x, y), (x + int(angle_len*sin_y*cos_p), y + int(angle_len*sin_p)), (255, 0, 0), thickness=3)
-        
-        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+        # Find x, y mid point
+        midpoint_x = (point1[0] + point2[0]) / 2
+        midpoint_y = (point1[1] + point2[1]) / 2
 
-    def createEyeBoundingBox(self, org_frame, landmarks, roi):
-        w = int(roi[0].size[0])
-        h = int(roi[0].size[1])
-        x = int(roi[0].position[0])
-        y = int(roi[0].position[1])
-        cropped = org_frame[y:y+h, x:x+w]        
-        lef_eye_x = landmarks.left_eye[0] * w
-        lef_eye_y = landmarks.left_eye[1] * h
-        rig_eye_x = landmarks.right_eye[0] * w
-        rig_eye_y = landmarks.right_eye[1] * h
-        out = np.asarray([lef_eye_x,lef_eye_y,rig_eye_x,rig_eye_y])
-        coords = out.astype(np.int32)
-        left_eye_xmin = (coords[0]-15)
-        left_eye_ymin = (coords[1]-15)
-        left_eye_xmax = (coords[0]+15)
-        left_eye_ymax = (coords[1]+15)
-        right_eye_xmin = coords[2]-15  
-        right_eye_ymin = coords[3]-15
-        right_eye_xmax = coords[2]+15
-        right_eye_ymax = coords[3]+15
-        self.left_eye_coords=cropped[left_eye_ymin:left_eye_ymax,left_eye_xmin:left_eye_xmax]
-        self.right_eye_coords=cropped[right_eye_ymin:right_eye_ymax,right_eye_xmin:right_eye_xmax]
-        self.eye=[[left_eye_xmin,left_eye_ymin,left_eye_xmax,left_eye_ymax],
-                 [right_eye_xmin,right_eye_ymin,right_eye_xmax,right_eye_ymax]]
+        # Calculate eye x, y point
+        startX = midpoint_x - (width / 2)
+        startY = midpoint_y - (height / 2)
+        return [int(startX), int(startY), int(width), int(height)]
 
-    def draw_detection_keypoints(self, frame, landmarks, roi, org_frame):
+    def landmarkPostProcessing(self, frame, landmarks, roi, org_frame):
+        """
+        Calculate right eye bounding box and left eye bounding box by using
+        landmark keypoints
+
+        Args:
+        frame: Frame to resize/crop
+        landmark: Keypoints
+        roi: Detection output of Facial detection model
+        org_frame: Orginal frame
+
+        return:
+        list of left and right bounding box
+        """
+        faceBoundingBoxWidth = roi[0].size[0]
+        faceBoundingBoxHeight = roi[0].size[1]
+
         keypoints = [landmarks.left_eye,
                      landmarks.right_eye,
                      landmarks.nose_tip,
                      landmarks.left_lip_corner,
                      landmarks.right_lip_corner]
 
+        faceLandmarks = []
+        left_eye_x = (landmarks.left_eye[0] * faceBoundingBoxWidth + roi[0].position[0])
+        left_eye_y = (landmarks.left_eye[1] * faceBoundingBoxHeight + roi[0].position[1])
+        faceLandmarks.append([left_eye_x, left_eye_y])
+
+        right_eye_x = (landmarks.right_eye[0] * faceBoundingBoxWidth + roi[0].position[0])
+        right_eye_y = (landmarks.right_eye[1] * faceBoundingBoxHeight + roi[0].position[1])
+        faceLandmarks.append([right_eye_x, right_eye_y])
+        
+        nose_tip_x = (landmarks.nose_tip[0] * faceBoundingBoxWidth + roi[0].position[0])
+        nose_tip_y = (landmarks.nose_tip[1] * faceBoundingBoxHeight + roi[0].position[1])
+        faceLandmarks.append([nose_tip_x, nose_tip_y])
+        
+        left_lip_corner_x = (landmarks.left_lip_corner[0] * faceBoundingBoxWidth + roi[0].position[0])
+        left_lip_corner_y = (landmarks.left_lip_corner[1] * faceBoundingBoxHeight + roi[0].position[1])
+        faceLandmarks.append([left_lip_corner_x, left_lip_corner_y])
+        
+        leftEyeBox = self.createEyeBoundingBox(faceLandmarks[0], 
+                                    faceLandmarks[1],
+                                    1.8)
+
+        RightEyeBox = self.createEyeBoundingBox(faceLandmarks[2], 
+                                    faceLandmarks[3],
+                                    1.8)
+        # To crop image
+        # img[y:y+h, x:x+w]
+        leftEyeBox_img = org_frame[leftEyeBox[1] : leftEyeBox[1] + leftEyeBox[3], 
+                             leftEyeBox[0] : leftEyeBox[0] + leftEyeBox[2]]
+
+        RightEyeBox_img = org_frame[RightEyeBox[1] : RightEyeBox[1] + RightEyeBox[3], 
+                             RightEyeBox[0] : RightEyeBox[0] + RightEyeBox[2]]
+
+        return (RightEyeBox_img, leftEyeBox_img)
+
+    def draw_final_result(self, frame, roi, headAngle, landmarks, gaze_vector):
+        """
+        Draw the final output on frame including facial detection input, 
+        face landmarks, head angles and gaze vector
+        """
+
+        faceBoundingBoxWidth = roi[0].size[0]
+        faceBoundingBoxHeight = roi[0].size[1]
+
+        # Draw Face detection bounding Box
+        for i in range(len(roi)):
+            # Draw face ROI border
+            cv2.rectangle(frame,
+                        tuple(roi[i].position), tuple(roi[i].position + roi[i].size),
+                        (0, 0, 255), 4)
+
+        # Draw headPoseAxes
+        # Here head_position_x --> angle_y_fc  # Yaw
+        #      head_position_y --> angle_p_fc  # Pitch
+        #      head_position_z --> angle_r_fc  # Roll
+        yaw = headAngle.head_position_x
+        pitch = headAngle.head_position_y
+        roll = headAngle.head_position_z
+
+        sinY = sin(yaw * pi / 180.0)
+        sinP = sin(pitch * pi / 180.0)
+        sinR = sin(roll * pi / 180.0)
+
+        cosY = cos(yaw * pi / 180.0)
+        cosP = cos(pitch * pi / 180.0)
+        cosR = cos(roll * pi / 180.0)
+        
+        axisLength = 0.4 * faceBoundingBoxWidth
+        xCenter = int(roi[i].position[0] + faceBoundingBoxWidth / 2)
+        yCenter = int(roi[i].position[1] + faceBoundingBoxHeight / 2)
+
+        # center to right
+        cv2.line(frame, (xCenter, yCenter), 
+                        (((xCenter) + int (axisLength * (cosR * cosY + sinY * sinP * sinR))),
+                         ((yCenter) + int (axisLength * cosP * sinR))),
+                        (0, 0, 255), thickness=2)
+        # center to top
+        cv2.line(frame, (xCenter, yCenter), 
+                        (((xCenter) + int (axisLength * (cosR * sinY * sinP + cosY * sinR))),
+                         ((yCenter) - int (axisLength * cosP * cosR))),
+                        (0, 255, 0), thickness=2)
+        
+        # Center to forward
+        cv2.line(frame, (xCenter, yCenter), 
+                        (((xCenter) + int (axisLength * sinY * cosP)),
+                         ((yCenter) + int (axisLength * sinP))),
+                        (255, 0, 0), thickness=2)
+        
+        # Draw landmark 
+        keypoints = [landmarks.left_eye,
+                landmarks.right_eye,
+                landmarks.nose_tip,
+                landmarks.left_lip_corner,
+                landmarks.right_lip_corner]
+
         for point in keypoints:
             center = roi[0].position + roi[0].size * point
-            cv2.circle(frame, tuple(center.astype(int)), 2, (0, 255, 255), 2)
-        self.createEyeBoundingBox(org_frame, landmarks, roi)
+            cv2.circle(frame, tuple(center.astype(int)), 2, (255, 255, 0), 4)
+        
+        # Draw Gaz vector with final frame
+        left_eye_x = (landmarks.left_eye[0] * faceBoundingBoxWidth + roi[0].position[0])
+        left_eye_y = (landmarks.left_eye[1] * faceBoundingBoxHeight + roi[0].position[1])
+        
+        right_eye_x = (landmarks.right_eye[0] * faceBoundingBoxWidth + roi[0].position[0])
+        right_eye_y = (landmarks.right_eye[1] * faceBoundingBoxHeight + roi[0].position[1])
+        
+        nose_tip_x = (landmarks.nose_tip[0] * faceBoundingBoxWidth + roi[0].position[0])
+        nose_tip_y = (landmarks.nose_tip[1] * faceBoundingBoxHeight + roi[0].position[1])
+        
+        left_lip_corner_x = (landmarks.left_lip_corner[0] * faceBoundingBoxWidth + roi[0].position[0])
+        left_lip_corner_y = (landmarks.left_lip_corner[1] * faceBoundingBoxHeight + roi[0].position[1])
+        
+        leftEyeMidpoint_start = int(((left_eye_x + right_eye_x)) / 2)
+        leftEyeMidpoint_end = int(((left_eye_y + right_eye_y)) / 2)
+        rightEyeMidpoint_start = int((nose_tip_x + left_lip_corner_x) / 2)
+        rightEyeMidpoint_End = int((nose_tip_y + left_lip_corner_y) / 2)
+        
+        # Gaze out
+        arrowLength = 0.4 * faceBoundingBoxWidth
+        gaze = gaze_vector[0]
+        gazeArrow_x = int((gaze[0]) * arrowLength)
+        gazeArrow_y = int(-(gaze[1]) * arrowLength)
+
+        cv2.arrowedLine(frame, 
+                         (leftEyeMidpoint_start, leftEyeMidpoint_end), 
+                         ((leftEyeMidpoint_start + gazeArrow_x), 
+                          leftEyeMidpoint_end + (gazeArrow_y)),
+                          (0, 255, 0), 3)
+
+        cv2.arrowedLine(frame, 
+                         (rightEyeMidpoint_start, rightEyeMidpoint_End), 
+                         ((rightEyeMidpoint_start + gazeArrow_x), 
+                          rightEyeMidpoint_End + (gazeArrow_y)),
+                          (0, 255, 0), 3)
 
     def display_interactive_window(self, frame):
         """
@@ -347,6 +508,7 @@ class DriverMointoring:
         Args:
         frame: The input frame
         """
+
         color = (255, 255, 255)
         font = cv2.FONT_HERSHEY_SIMPLEX
         text_scale = 0.5
@@ -399,15 +561,21 @@ class DriverMointoring:
             # Get face landmarks 
             landmarks = self.frame_processor.face_landmark_detector_process(frame)
 
-            # Draw Face ROI detection
-            self.draw_detection_roi(frame, detections)
-
-            # Draw head position
-            self.draw_head_poistion_points(frame, headPosition, detections)
-
             # Draw detection keypoints
-            self.draw_detection_keypoints(frame, landmarks[0], detections, self.org_frame)
+            output = self.landmarkPostProcessing(frame, landmarks[0], detections, self.org_frame)
 
+            gaze = self.frame_processor.gaze_estimation_process(headPosition, 
+                                output[0], output[1])
+            gaze_vector = gaze[0]
+            # print(type(gaze_vector))
+            
+            gaze_vector = gaze_vector['gaze_vector']
+
+            # Draw gaze detection
+            # self.draw_gaze_detection(frame, gaze_vector, output[0], output[1], output[2], 
+            #                         detections, self.org_frame)
+            self.draw_final_result(frame, detections, headPosition, 
+                                   landmarks[0], gaze_vector)
             # Write on disk 
             if output_stream:
                 output_stream.write(frame)
